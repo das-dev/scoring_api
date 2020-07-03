@@ -64,7 +64,8 @@ class Field(abc.ABC, AutoStorage):
             raise ValueError('required value is missing')
         if not value and not self.nullable:
             raise ValueError('value can\'t be empty')
-        value = value and self.validate(instance, value)
+        if value is not None:
+            value = self.validate(instance, value)
         super().__set__(instance, value)
 
     @abc.abstractmethod
@@ -88,6 +89,7 @@ class ArgumentsField(Field):
 
 class EmailField(CharField):
     def validate(self, instance, value):
+        value = super().validate(instance, value)
         if not isinstance(value, str):
             raise ValueError('invalid email')
         if '@' not in value:
@@ -205,9 +207,9 @@ class OnlineScoreRequest(Method):
     gender = GenderField(required=False, nullable=True)
 
     def validate(self):
-        pairs = [('phone', 'email'), ('first name', 'last name'), ('gender', 'birthday')]
+        pairs = [('phone', 'email'), ('first_name', 'last_name'), ('gender', 'birthday')]
         for left, right in pairs:
-            if self.kwargs.get(left) and self.kwargs.get(right):
+            if left in self.kwargs and right in self.kwargs:
                 return super().validate()
         return False, 'too few values'
 
@@ -218,7 +220,7 @@ class OnlineScoreRequest(Method):
             'first_name': self.first_name, 'last_name': self.last_name
         }
         score = 42 if ctx.get('is_admin') else get_score(store, **kwargs)
-        ctx['has'] = [k for k, v in self.kwargs.items() if v]
+        ctx['has'] = [k for k, v in self.kwargs.items() if v is not None]
         return {'score': score}
 
 
