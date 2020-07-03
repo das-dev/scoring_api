@@ -3,14 +3,16 @@
 
 import abc
 import json
-import datetime
+import uuid
 import logging
 import hashlib
-import uuid
+import datetime
+
 from optparse import OptionParser
+from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from scoring import get_interests
+from scoring import get_interests, get_score
 
 SALT = "Otus"
 ADMIN_LOGIN = "admin"
@@ -38,14 +40,9 @@ GENDERS = {
 }
 
 
-class AutoStorage(object):
-    __count = 0
-
-    def __init__(self, required=False, nullable=False):
-        self.required = required
-        self.nullable = nullable
-        self.storage_name = f'_{self.__class__.__name__}_{self.__class__.__count}'
-        self.__class__.__count += 1
+class AutoStorage:
+    def __init__(self, *args, **kwargs):
+        self.storage_name = None
 
     def __get__(self, instance, owner):
         if instance is None:
@@ -57,12 +54,17 @@ class AutoStorage(object):
 
 
 class Field(abc.ABC, AutoStorage):
+    def __init__(self, required=False, nullable=False):
+        super().__init__()
+        self.required = required
+        self.nullable = nullable
+
     def __set__(self, instance, value):
         if value is None and self.required:
             raise ValueError('required value is missing')
         if not value and not self.nullable:
             raise ValueError('value can\'t be empty')
-        value = self.validate(instance, value)
+        value = value and self.validate(instance, value)
         super().__set__(instance, value)
 
     @abc.abstractmethod
@@ -73,7 +75,7 @@ class Field(abc.ABC, AutoStorage):
 class CharField(Field):
     def validate(self, instance, value):
         if not isinstance(value, str):
-            raise ValueError(f'value must be a string, got {value!r}')
+            raise ValueError(f'value must be a string or null, got {value!r}')
         return value.strip()
 
 
@@ -87,9 +89,9 @@ class ArgumentsField(Field):
 class EmailField(CharField):
     def validate(self, instance, value):
         if not isinstance(value, str):
-            raise ValueError()
+            raise ValueError('invalid email')
         if '@' not in value:
-            raise ValueError()
+            raise ValueError('invalid email')
         return value
 
 
@@ -120,14 +122,14 @@ class BirthDayField(DateField):
         date = datetime.datetime.strptime(value, '%d.%m.%Y')
         too_old = datetime.timedelta(70*365)
         if datetime.datetime.now() - date > too_old:
-            raise ValueError()
+            raise ValueError('error')
         return value
 
 
 class GenderField(Field):
     def validate(self, instance, value):
         if GENDERS.get(value) is None:
-            raise ValueError()
+            raise ValueError('error')
         return value
 
 
@@ -135,31 +137,53 @@ class ClientIDsField(Field):
     def validate(self, instance, value):
         if not isinstance(value, list):
             raise ValueError(f'value must be a list, got {value!r}')
+        if not all(isinstance(n, int) for n in value):
+            raise ValueError(f'value must be a list of integers')
         if not value:
             raise ValueError(f'value must be a not empty, got {value!r}')
         return value
 
 
-class Request:
+class RequestMeta(abc.ABC, type):
+    @classmethod
+    def __prepare__(metacls, name, bases):
+        return OrderedDict()
+
+    def __init__(cls, name, bases, attr_dict):
+        super().__init__(name, bases, attr_dict)
+        cls._field_names = []
+        for key, attr in attr_dict.items():
+            if isinstance(attr, Field):
+                attr.storage_name = key
+                cls._field_names.append(key)
+
+
+class Request(metaclass=RequestMeta):
     def __init__(self, **kwargs):
         self.kwargs = kwargs
         self.is_valid, self.error = self.validate()
 
+    @classmethod
+    def fields_names(cls):
+        for field in cls._field_names:
+            yield field
+
     def validate(self):
-        try:
-            for attr, value in self.kwargs.items():
-                setattr(self, attr, value)
-        except ValueError as e:
-            return False, str(e)
+        for field in self.fields_names():
+            value = self.kwargs.get(field)
+            try:
+                setattr(self, field, value)
+            except ValueError as e:
+                return False, str(e)
         return True, ''
 
 
-class Method(abc.ABC, Request):
-    def response(self, store):
-        return json.dumps(self.make_response(store))
+class Method(Request):
+    def response(self, store, ctx):
+        return self.make_response(store, ctx)
 
     @abc.abstractmethod
-    def make_response(self, store):
+    def make_response(self, store, ctx):
         """ make a response """
 
 
@@ -167,7 +191,8 @@ class ClientsInterestsRequest(Method):
     client_ids = ClientIDsField(required=True)
     date = DateField(required=False, nullable=True)
 
-    def make_response(self, store):
+    def make_response(self, store, ctx):
+        ctx['nclients'] = len(self.client_ids)
         return {cid: get_interests(store, cid) for cid in self.client_ids}
 
 
@@ -179,8 +204,22 @@ class OnlineScoreRequest(Method):
     birthday = BirthDayField(required=False, nullable=True)
     gender = GenderField(required=False, nullable=True)
 
-    def make_response(self, store):
-        return ''
+    def validate(self):
+        pairs = [('phone', 'email'), ('first name', 'last name'), ('gender', 'birthday')]
+        for left, right in pairs:
+            if self.kwargs.get(left) and self.kwargs.get(right):
+                return super().validate()
+        return False, 'too few values'
+
+    def make_response(self, store, ctx):
+        kwargs = {
+            'phone': self.phone, 'email': self.email,
+            'birthday': self.birthday, 'gender': self.gender,
+            'first_name': self.first_name, 'last_name': self.last_name
+        }
+        score = 42 if ctx.get('is_admin') else get_score(store, **kwargs)
+        ctx['has'] = [k for k, v in self.kwargs.items() if v]
+        return {'score': score}
 
 
 class MethodRequest(Request):
@@ -208,7 +247,7 @@ def check_auth(request):
 
 
 def method_handler(request, ctx, store):
-    methods = {'online_score': OnlineScoreRequest, 'client_interests': ClientsInterestsRequest}
+    methods = {'online_score': OnlineScoreRequest, 'clients_interests': ClientsInterestsRequest}
     data = MethodRequest(**request.get('body'))
     if not request.get('body'):
         return 'empty request', INVALID_REQUEST
@@ -220,7 +259,8 @@ def method_handler(request, ctx, store):
     method = methods.get(data.method)(**arguments)
     if not method.is_valid:
         return method.error, INVALID_REQUEST
-    return method.response(store), OK
+    ctx['is_admin'] = data.is_admin
+    return method.response(store, ctx), OK
 
 
 class MainHTTPHandler(BaseHTTPRequestHandler):
